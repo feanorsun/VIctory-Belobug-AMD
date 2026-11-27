@@ -4,9 +4,10 @@
 pub(crate) mod host_wave;
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::Result;
 use victory_shader::emit::host::{self, Host};
@@ -161,6 +162,43 @@ fn worker_threads(jobs: Option<usize>) -> usize {
         .max(1)
 }
 
+#[derive(Default)]
+struct WarmResults {
+    translated: AtomicUsize,
+    cached: AtomicUsize,
+    failures: Mutex<BTreeMap<String, usize>>,
+}
+
+impl WarmResults {
+    fn record(&self, result: Result<bool, String>) {
+        match result {
+            Ok(true) => {
+                self.translated.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(false) => {
+                self.cached.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(why) => *lock(&self.failures).entry(why).or_default() += 1,
+        }
+    }
+
+    fn report(self, asked: &str, seconds: f64, threads: usize, timed_out: bool) -> String {
+        let translated = self.translated.into_inner();
+        let cached = self.cached.into_inner();
+        let failures = self.failures.into_inner().unwrap_or_else(|e| e.into_inner());
+        let failed: usize = failures.values().sum();
+        let found = translated + cached + failed;
+        let stopped = if timed_out { " (stopped at the time limit)" } else { "" };
+        let mut report = format!(
+            "warm-up      {asked} hashes asked, {found} found: {translated} translated now, {cached} in the cache already, {failed} failed; {seconds:.1} s on {threads} threads{stopped}"
+        );
+        for (why, n) in failures {
+            write!(report, "\n  {n:>5}  {why}").unwrap();
+        }
+        report
+    }
+}
+
 /// `translate --warm <file>`: the containers whose hash the file names are
 /// translated into the run's shader cache, on `jobs` threads; nothing is
 /// made on the GPU. A run of the title then finds them there instead of
@@ -189,7 +227,9 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, wave: Option<
     let threads = worker_threads(jobs);
     let began = std::time::Instant::now();
     let done = Mutex::new(HashSet::new());
-    let counts = [const { AtomicUsize::new(0) }; 5];
+    let results = WarmResults::default();
+    let timed_out = AtomicBool::new(false);
+    let started = AtomicUsize::new(0);
     for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
@@ -209,36 +249,26 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, wave: Option<
                             };
                             let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
                             if limit.is_some_and(|n| began.elapsed().as_secs() >= n) {
-                                counts[3].fetch_add(1, Ordering::Relaxed);
+                                timed_out.store(true, Ordering::Relaxed);
                                 break;
                             }
                             if (!all && !wanted.contains(&hash)) || !lock(&done).insert(hash) {
                                 continue;
                             }
-                            let n = counts[4].fetch_add(1, Ordering::Relaxed) + 1;
+                            let n = started.fetch_add(1, Ordering::Relaxed) + 1;
                             if n.is_multiple_of(1000) {
                                 println!("warm-up      {n} shaders so far, {:.0} s", began.elapsed().as_secs_f64());
                             }
-                            let which = match victory_hle::modules::d3d12x::warm_shader(&bytes) {
-                                Ok(true) => 0,
-                                Ok(false) => 1,
-                                Err(_) => 2,
-                            };
-                            counts[which].fetch_add(1, Ordering::Relaxed);
+                            results.record(victory_hle::modules::d3d12x::warm_shader(&bytes));
                         }
                     });
                 }
             });
         }
     }
-    let [translated, there, failed] = [0, 1, 2].map(|i| counts[i].load(Ordering::Relaxed));
     let asked = if all { "all".to_owned() } else { wanted.len().to_string() };
-    let stopped = if counts[3].load(Ordering::Relaxed) > 0 { " (stopped at the time limit)" } else { "" };
-    println!(
-        "warm-up      {asked} hashes asked, {} found: {translated} translated now, {there} in the cache already, {failed} do not translate; {:.1} s on {threads} threads{stopped}",
-        translated + there + failed,
-        began.elapsed().as_secs_f64()
-    );
+    let report = results.report(&asked, began.elapsed().as_secs_f64(), threads, timed_out.into_inner());
+    println!("{report}");
     Ok(())
 }
 
@@ -982,6 +1012,40 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn warm_report_groups_original_failure_reasons() {
+        let results = super::WarmResults::default();
+        for result in [
+            Ok(true),
+            Err("cache write: synthetic I/O error".to_owned()),
+            Ok(false),
+            Err("translation: unsupported opcode".to_owned()),
+            Err("cache write: synthetic I/O error".to_owned()),
+        ] {
+            results.record(result);
+        }
+        assert_eq!(
+            results.report("all", 0.0, 2, false),
+            concat!(
+                "warm-up      all hashes asked, 5 found: 1 translated now, 1 in the cache already, ",
+                "3 failed; 0.0 s on 2 threads\n",
+                "      2  cache write: synthetic I/O error\n",
+                "      1  translation: unsupported opcode"
+            )
+        );
+    }
+
+    #[test]
+    fn warm_report_without_failures_only_prints_the_summary() {
+        let results = super::WarmResults::default();
+        results.record(Ok(true));
+        results.record(Ok(false));
+        assert_eq!(
+            results.report("3", 1.5, 2, true),
+            "warm-up      3 hashes asked, 2 found: 1 translated now, 1 in the cache already, 0 failed; 1.5 s on 2 threads (stopped at the time limit)"
+        );
+    }
+
     /// No `--jobs` is every logical core on the three paths, `--warm`
     /// included, and never fewer than one worker.
     #[test]
